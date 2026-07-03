@@ -85,6 +85,14 @@
 
 ## Next steps
 
+0. **NEW, most urgent (2026-07-03): user hit a live hang after switching model + adding API credits** —
+   `POST /api/tailor` streams `parse-cv`/`score`/`derive-clarifying-questions` steps then never
+   yields a `result` or `error`, page stays stuck. Different symptom from the earlier billing
+   issue (credits are presumably now added). Workflow `wf_2fb378f8-572` launched (4 parallel
+   hypotheses: slow/hung LLM call with no request timeout, a loop-composition bug in the
+   analyze→generate handoff, a client-side stream-consumption bug, a DB/rate-limit hang) → fix →
+   verify. **Read its result before doing anything else** — do not assume which hypothesis was
+   right.
 0. **Three user-reported `POST /api/tailor` failures, all diagnosed + fixed (2026-07-03).** The
    third one exposed a real logging-placement mistake in the first two fixes: `route.ts`'s outer
    catch (where I first added `console.error`) only fires for infrastructure errors (missing
