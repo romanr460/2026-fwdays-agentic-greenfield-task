@@ -102,8 +102,17 @@
    ground-bullet) funnels its real failure cause through, so it covers every step, not just the
    two infra-level cases the route-level fix covered. `StepFailedError` also now carries the
    original error as `cause`. Verified via the existing `loop.test.ts` fail-honest test, whose
-   stderr output now shows exactly the intended log line. **Not yet committed — commit next.**
-   Original two (kept, still correct for their narrower cases):
+   stderr output now shows exactly the intended log line. Committed `0d40e56`, pushed.
+   **Root cause found via the new log line: Anthropic API credit balance too low** (400
+   `invalid_request_error` from the real `extract-requirements` call) — not a bug, a billing
+   gap. Claude.ai Pro subscription does NOT cover API usage; the Anthropic API is billed
+   separately (console.anthropic.com → Plans & Billing → add credits). User action, nothing left
+   to fix in code for this thread — the observability work (both logging fixes) is what actually
+   made this diagnosable at all. Separately clarified: the user was running `yarn dev` from their
+   own main checkout, not this worktree, so none of these fixes were reachable until they
+   fetch+checkout `worktree-continue-vouch-threads` (or run from
+   `.claude/worktrees/continue-vouch-threads` directly) — see Blockers.
+   Original two fixes (kept, still correct for their narrower cases):
    - First report (~17ms failure) was `ANTHROPIC_API_KEY` unset — expected fail-honest behavior
      per `docs/dev-setup.md`, not a bug; agents can't touch `.env*`, user action to set it.
    - Added server-side `console.error` logging (client NDJSON contract unchanged) to the outer
@@ -143,6 +152,17 @@
 
 ## Blockers / open questions
 
+- **User's live-testing checkout is separate from this worktree** — they run `yarn dev` from
+  their own main directory on (presumably) `vouch`, not `.claude/worktrees/continue-vouch-threads`
+  / branch `worktree-continue-vouch-threads` where agent sessions commit. Every fix this session
+  needed an explicit "fetch + checkout the branch" instruction before it was actually reachable —
+  caused real confusion/frustration across multiple turns. Resolve by merging
+  `worktree-continue-vouch-threads` into `vouch` (see Next steps) so the user's normal checkout
+  gets fixes without a manual branch switch each time.
+- **`ANTHROPIC_API_KEY` set but out of API credits** (2026-07-03) — confirmed via the new
+  step-level error logging (`0d40e56`): Claude.ai Pro subscription doesn't cover API billing,
+  they're separate. User needs to add credits at console.anthropic.com → Plans & Billing before
+  any live tailoring run (extraction/generation/grounding) can succeed. Not a code issue.
 - **FR-TAILOR-02 step granularity** — the loop only emits `status`/`step`/one final `result`, no
   token-level streaming, and the current one-shot `TailoringForm` doesn't render `step` events.
   Real gap vs. "streams progress", not a blocker for any specific task — small follow-up.
