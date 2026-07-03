@@ -65,8 +65,8 @@ export interface LoopDeps {
 }
 
 class StepFailedError extends Error {
-  constructor(skill: SkillName) {
-    super(`step_failed:${skill}`);
+  constructor(skill: SkillName, cause: unknown) {
+    super(`step_failed:${skill}`, { cause });
   }
 }
 
@@ -84,7 +84,7 @@ function makeStepRunner(steps: TraceStep[]) {
     llmPayload: string | undefined,
     fn: () => Promise<T>,
   ): Promise<T> {
-    if (steps.length >= STEP_CAP) throw new StepFailedError(skill);
+    if (steps.length >= STEP_CAP) throw new StepFailedError(skill, new Error("step_cap_exceeded"));
     let attempts = 0;
     for (;;) {
       attempts += 1;
@@ -94,6 +94,15 @@ function makeStepRunner(steps: TraceStep[]) {
         return value;
       } catch (error) {
         if (attempts >= MAX_ATTEMPTS) {
+          // Server-side only — the client's NDJSON stream never gets more
+          // than a coded "failed" event (NFR-OBS-01 protects the end user,
+          // not the operator trying to find out why a run actually failed).
+          // This is the ONE place every skill's real failure cause (a bad
+          // API key, a malformed model response, a network error, ...)
+          // funnels through before being discarded into StepFailedError —
+          // route.ts's own catch never sees it, since the phase generators
+          // below convert this into a calm yielded event, not a rethrow.
+          console.error(`[run-tailoring] step "${skill}" failed after ${attempts} attempts`, error);
           steps.push({
             skill,
             attempts,
@@ -101,9 +110,9 @@ function makeStepRunner(steps: TraceStep[]) {
             contextKeys,
             ...(llmPayload ? { llmPayload } : {}),
           });
-          throw new StepFailedError(skill);
+          throw new StepFailedError(skill, error);
         }
-        void error; // retried — the final failure is what surfaces (NFR-OBS-01)
+        void error; // retried — the final attempt (above) is what gets logged
       }
     }
   };

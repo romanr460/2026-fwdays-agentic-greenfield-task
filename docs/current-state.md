@@ -85,7 +85,25 @@
 
 ## Next steps
 
-0. **Two user-reported `POST /api/tailor` failures, both diagnosed + fixed (2026-07-03):**
+0. **Three user-reported `POST /api/tailor` failures, all diagnosed + fixed (2026-07-03).** The
+   third one exposed a real logging-placement mistake in the first two fixes: `route.ts`'s outer
+   catch (where I first added `console.error`) only fires for infrastructure errors (missing
+   key at `resolveLlmProvider()`, budget reservation) — a failure INSIDE the loop (an actual
+   LLM/parse error mid-step) is caught by `loop.ts`'s own `makeStepRunner` retry logic and turned
+   into a calm yielded event, **never rethrown to the route handler at all**, so that logging
+   never had a chance to fire for the most common failure shape. Confirmed via a live repro: user
+   saw `step:parse-cv` succeed then immediately `error:failed` after ~1.1s (three retried Anthropic
+   calls, not a fast synchronous config throw) with `POST /api/tailor 200 in 1095ms` and genuinely
+   nothing in the server console — proving the gap, not a fluke. Fixed at the real choke point:
+   `makeStepRunner`'s retry-exhausted branch (`loop.ts`, was `void error` + a bare
+   `StepFailedError(skill)`) now does `console.error('[run-tailoring] step "<skill>" failed after
+   N attempts', error)` before throwing — this is the ONE place every skill in both phases
+   (parse-cv, extract-requirements, score, derive-clarifying-questions, generate-bullet,
+   ground-bullet) funnels its real failure cause through, so it covers every step, not just the
+   two infra-level cases the route-level fix covered. `StepFailedError` also now carries the
+   original error as `cause`. Verified via the existing `loop.test.ts` fail-honest test, whose
+   stderr output now shows exactly the intended log line. **Not yet committed — commit next.**
+   Original two (kept, still correct for their narrower cases):
    - First report (~17ms failure) was `ANTHROPIC_API_KEY` unset — expected fail-honest behavior
      per `docs/dev-setup.md`, not a bug; agents can't touch `.env*`, user action to set it.
    - Added server-side `console.error` logging (client NDJSON contract unchanged) to the outer
