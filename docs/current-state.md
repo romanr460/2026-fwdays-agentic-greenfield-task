@@ -7,31 +7,27 @@
 
 ## Last action
 
-- **Live-hang investigation (`wf_2fb378f8-572`) — hypothesis "slow/hung LLM call with no
-  request timeout" CONFIRMED and FIXED (2026-07-03, not yet committed).** Root cause: no
-  call in `runTailoringLoop`'s LLM path (`src/features/run-tailoring/lib/loop.ts`) ever passed
-  an `AbortSignal`, so a stalled real call inherited the Anthropic SDK's own 10-minute default
-  timeout (itself retried up to 2 more times by the SDK, confirmed in
-  `node_modules/@anthropic-ai/sdk/client.js`), stacked underneath this file's own
-  `MAX_ATTEMPTS=3` retry loop — worst case ≈ 90 min of silence before a calm `error` event, which
-  reads exactly like "hangs with no result and no error." Fix (minimal, contained to `loop.ts`):
-  `makeStepRunner` now creates a fresh `AbortController` per attempt with a 20 s timer
-  (`STEP_TIMEOUT_MS`, exported like `STEP_CAP`) and threads `controller.signal` into `fn`; the
-  three real LLM call sites (`extract-requirements`, `generate-bullet`, `ground-bullet`) now pass
-  `signal` through to `deps.llm.complete(...)`. Verified the SDK checks `options.signal?.aborted`
-  *before* its own retry-on-timeout logic (`client.js:499-502`), so an external abort bypasses the
-  SDK's internal retries entirely — no need to touch `claude.ts`'s client construction. This same
-  fix covers `/api/tailor`, `/api/tailor/analyze`, and `/api/tailor/generate` (all three route
-  through `runAnalysisPhase`/`runGenerationPhase`). Added a regression test
-  (`loop.test.ts`, "aborts a stalled LLM call instead of hanging forever") using a provider that
-  only settles via the passed-in signal + `vi.useFakeTimers()`/`advanceTimersByTimeAsync` —
-  confirmed it genuinely hangs and times out against the pre-fix code (reverted via `git stash`,
-  re-ran, 8 s test-level timeout tripped), then passes in 14 ms with the fix restored. Full suite
-  green: `yarn lint` clean, `yarn build` clean, `yarn vitest run` **69 files / 444 tests, all
-  green** (includes the one new regression test). **Not yet committed** — this session only fixed the one
-  confirmed hypothesis; reconcile with the workflow's other 3 parallel hypotheses (loop-composition
-  bug, client-side stream-consumption bug, DB/rate-limit hang) before assuming the live hang is
-  fully closed, then commit.
+- **Live-hang bug fixed + committed (`3a25ca3`).** Investigated via a 4-hypothesis parallel
+  workflow (`wf_2fb378f8-572`): "slow/hung LLM call with no request timeout" CONFIRMED; the other
+  three (loop-composition bug in the analyze/generate handoff, client-side stream-consumption bug,
+  DB/rate-limit hang) were traced through the actual current code and genuinely ruled out with
+  evidence, not assumed clean. Root cause: no call in `runTailoringLoop`'s LLM path
+  (`src/features/run-tailoring/lib/loop.ts`) ever passed an `AbortSignal`, so a stalled real call
+  inherited the Anthropic SDK's own 10-minute default timeout (itself retried up to 2 more times
+  by the SDK), stacked underneath this file's own `MAX_ATTEMPTS=3` retry loop — worst case ≈ 90
+  min of silence before a calm `error` event, reading exactly like "hangs with no result and no
+  error." Fix: `makeStepRunner` now creates a fresh `AbortController` per attempt with a 20 s
+  timer (`STEP_TIMEOUT_MS`, exported like `STEP_CAP`) and threads `controller.signal` into every
+  real LLM call site (`extract-requirements`, `generate-bullet`, `ground-bullet`) — the SDK checks
+  an external abort signal before its own retry-on-timeout logic, so this fully bypasses the SDK's
+  internal retries too. Covers `/api/tailor`, `/api/tailor/analyze`, and `/api/tailor/generate`
+  (all three route through `runAnalysisPhase`/`runGenerationPhase`). Worst case is now a bounded
+  60 s (20 s × 3 attempts) before a calm NDJSON error. **Independently re-verified this session**
+  (not just the workflow's own report): `yarn lint`/`yarn build` clean, `yarn test` **69 files /
+  444 tests, all green**; the new regression test (fake timers, exactly 3 aborted attempts, 14 ms)
+  passes, and the workflow's own live reproduction (a real TCP server that accepts the connection
+  but never responds — the reported symptom exactly) confirmed the request now fails calmly at
+  60 s instead of hanging.
 - **`add-resume-wizard` backend increment committed (`996d0ba`).** Implements tasks.md sections
   1 (minus 1.7), 2 (minus 2.5), 3 in full: `runTailoringLoop` split into `runAnalysisPhase`
   (parse-cv → extract-requirements → score → derive-clarifying-questions) +
@@ -110,14 +106,6 @@
 
 ## Next steps
 
-0. **NEW, most urgent (2026-07-03): user hit a live hang after switching model + adding API credits** —
-   `POST /api/tailor` streams `parse-cv`/`score`/`derive-clarifying-questions` steps then never
-   yields a `result` or `error`, page stays stuck. Different symptom from the earlier billing
-   issue (credits are presumably now added). Workflow `wf_2fb378f8-572` launched (4 parallel
-   hypotheses: slow/hung LLM call with no request timeout, a loop-composition bug in the
-   analyze→generate handoff, a client-side stream-consumption bug, a DB/rate-limit hang) → fix →
-   verify. **Read its result before doing anything else** — do not assume which hypothesis was
-   right.
 0. **Three user-reported `POST /api/tailor` failures, all diagnosed + fixed (2026-07-03).** The
    third one exposed a real logging-placement mistake in the first two fixes: `route.ts`'s outer
    catch (where I first added `console.error`) only fires for infrastructure errors (missing
