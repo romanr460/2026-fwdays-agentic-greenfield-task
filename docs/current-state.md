@@ -7,6 +7,31 @@
 
 ## Last action
 
+- **Live-hang investigation (`wf_2fb378f8-572`) — hypothesis "slow/hung LLM call with no
+  request timeout" CONFIRMED and FIXED (2026-07-03, not yet committed).** Root cause: no
+  call in `runTailoringLoop`'s LLM path (`src/features/run-tailoring/lib/loop.ts`) ever passed
+  an `AbortSignal`, so a stalled real call inherited the Anthropic SDK's own 10-minute default
+  timeout (itself retried up to 2 more times by the SDK, confirmed in
+  `node_modules/@anthropic-ai/sdk/client.js`), stacked underneath this file's own
+  `MAX_ATTEMPTS=3` retry loop — worst case ≈ 90 min of silence before a calm `error` event, which
+  reads exactly like "hangs with no result and no error." Fix (minimal, contained to `loop.ts`):
+  `makeStepRunner` now creates a fresh `AbortController` per attempt with a 20 s timer
+  (`STEP_TIMEOUT_MS`, exported like `STEP_CAP`) and threads `controller.signal` into `fn`; the
+  three real LLM call sites (`extract-requirements`, `generate-bullet`, `ground-bullet`) now pass
+  `signal` through to `deps.llm.complete(...)`. Verified the SDK checks `options.signal?.aborted`
+  *before* its own retry-on-timeout logic (`client.js:499-502`), so an external abort bypasses the
+  SDK's internal retries entirely — no need to touch `claude.ts`'s client construction. This same
+  fix covers `/api/tailor`, `/api/tailor/analyze`, and `/api/tailor/generate` (all three route
+  through `runAnalysisPhase`/`runGenerationPhase`). Added a regression test
+  (`loop.test.ts`, "aborts a stalled LLM call instead of hanging forever") using a provider that
+  only settles via the passed-in signal + `vi.useFakeTimers()`/`advanceTimersByTimeAsync` —
+  confirmed it genuinely hangs and times out against the pre-fix code (reverted via `git stash`,
+  re-ran, 8 s test-level timeout tripped), then passes in 14 ms with the fix restored. Full suite
+  green: `yarn lint` clean, `yarn build` clean, `yarn vitest run` **69 files / 444 tests, all
+  green** (includes the one new regression test). **Not yet committed** — this session only fixed the one
+  confirmed hypothesis; reconcile with the workflow's other 3 parallel hypotheses (loop-composition
+  bug, client-side stream-consumption bug, DB/rate-limit hang) before assuming the live hang is
+  fully closed, then commit.
 - **`add-resume-wizard` backend increment committed (`996d0ba`).** Implements tasks.md sections
   1 (minus 1.7), 2 (minus 2.5), 3 in full: `runTailoringLoop` split into `runAnalysisPhase`
   (parse-cv → extract-requirements → score → derive-clarifying-questions) +

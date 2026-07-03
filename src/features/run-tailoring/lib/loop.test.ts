@@ -12,18 +12,20 @@
 //   • score is deterministic and calls no LLM (FR-CHECKLIST-01, TC-PURE-01)
 import { exportBullets } from "@/entities/bullet";
 import { gradeTrajectory, MAX_ATTEMPTS, type RunTrace } from "@/shared/lib/evals";
+import type { LlmProvider } from "@/shared/lib/llm";
 import {
   createFakeProvider,
   fakeExtraction,
   fakeGeneration,
   fakeGrounding,
 } from "@/shared/lib/llm/testing/fake-provider";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { TailorRunEvent, TailoringRunInput, TailoringRunResult } from "../model/types";
 import {
   runGenerationPhase,
   runTailoringLoop,
+  STEP_TIMEOUT_MS,
   type GenerationEvent,
   type GenerationPhaseInput,
   type LoopDeps,
@@ -173,6 +175,49 @@ describe("runTailoringLoop", () => {
     const grade = gradeTrajectory(trace);
     expect(grade.checks.find((c) => c.id === "fail-honest-termination")?.ok).toBe(true);
     expect(grade.checks.find((c) => c.id === "retries-bounded")?.ok).toBe(true);
+  });
+
+  it("aborts a stalled LLM call instead of hanging forever (NFR-OBS-01 regression)", async () => {
+    // Regression for the confirmed bug: deps.llm.complete() used to be called
+    // with no `signal`, so a real call that never settles (a stalled network
+    // request) had nothing bounding it — the Anthropic SDK's own 10-minute
+    // default, stacked under this file's own MAX_ATTEMPTS retries, produced an
+    // effectively unbounded hang with no error ever reaching the client. This
+    // provider models exactly that: it never resolves/rejects on its own —
+    // ONLY the per-attempt AbortSignal settles it. Before the fix (no signal
+    // threaded through), this test would hang for real wall-clock time
+    // instead of failing fast.
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const stallingProvider: LlmProvider = {
+        async complete(_prompt, options) {
+          calls += 1;
+          return new Promise<string>((_resolve, reject) => {
+            options?.signal?.addEventListener("abort", () => reject(new Error("stalled_call")));
+          });
+        },
+        async *stream() {
+          // Unused by the loop (it only calls complete()); present to satisfy
+          // the LlmProvider port.
+        },
+      };
+
+      const donePromise = drive({ llm: stallingProvider }, INPUT);
+      // Fast-forward past every attempt's timeout without waiting in real time.
+      await vi.advanceTimersByTimeAsync(STEP_TIMEOUT_MS * MAX_ATTEMPTS + 1000);
+      const { events, trace } = await donePromise;
+
+      // extract-requirements is the first real LLM call the loop makes; it
+      // retried up to the bound, each attempt aborted by the timeout, then
+      // gave up — never a silent hang.
+      expect(calls).toBe(MAX_ATTEMPTS);
+      expect(events).toContainEqual({ type: "error", code: "failed" });
+      expect(events.at(-1)).toEqual({ type: "status", phase: "failed" });
+      expect(trace.terminated).toBe("failed");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("scores deterministically and calls no LLM in the score/parse steps (FR-CHECKLIST-01, TC-PURE-01)", async () => {

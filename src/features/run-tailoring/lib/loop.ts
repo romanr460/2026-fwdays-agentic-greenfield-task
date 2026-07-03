@@ -60,6 +60,19 @@ const EXTRACTION_MAX_TOKENS = 2048;
 const GENERATION_MAX_TOKENS = 4096;
 const GROUNDING_MAX_TOKENS = 1024;
 
+/**
+ * Hard per-attempt wall-clock budget for an LLM call (NFR-OBS-01, NFR-PERF-02).
+ * Without this, a stalled call inherits the Anthropic SDK's own 10-minute
+ * default timeout (itself retried up to 2 more times by the SDK) underneath
+ * this file's own MAX_ATTEMPTS retry loop — the two stack into an
+ * effectively unbounded hang with no error ever reaching the client, the
+ * opposite of fail-honest. A fresh AbortController per attempt (below) kills
+ * a stuck call on a human timescale instead, well inside the ~30s p95 this
+ * whole run is budgeted for. Exported (like STEP_CAP) so a test can assert
+ * against it instead of duplicating the magic number.
+ */
+export const STEP_TIMEOUT_MS = 20_000;
+
 export interface LoopDeps {
   readonly llm: LlmProvider;
 }
@@ -82,14 +95,20 @@ function makeStepRunner(steps: TraceStep[]) {
     skill: SkillName,
     contextKeys: readonly string[],
     llmPayload: string | undefined,
-    fn: () => Promise<T>,
+    fn: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
     if (steps.length >= STEP_CAP) throw new StepFailedError(skill, new Error("step_cap_exceeded"));
     let attempts = 0;
     for (;;) {
       attempts += 1;
+      // Fresh controller per attempt (NFR-OBS-01): a call that outlives
+      // STEP_TIMEOUT_MS is aborted so it counts as this attempt's failure and
+      // moves on to the next retry (or the calm failure below) instead of
+      // hanging — see STEP_TIMEOUT_MS's comment for why this is load-bearing.
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), STEP_TIMEOUT_MS);
       try {
-        const value = await fn();
+        const value = await fn(controller.signal);
         steps.push({ skill, attempts, contextKeys, ...(llmPayload ? { llmPayload } : {}) });
         return value;
       } catch (error) {
@@ -113,6 +132,8 @@ function makeStepRunner(steps: TraceStep[]) {
           throw new StepFailedError(skill, error);
         }
         void error; // retried — the final attempt (above) is what gets logged
+      } finally {
+        clearTimeout(timer);
       }
     }
   };
@@ -184,9 +205,10 @@ export async function* runAnalysisPhase(
       "extract-requirements",
       ["jdText"],
       JSON.stringify(extractionPrompt),
-      async () => {
+      async (signal) => {
         const raw = await deps.llm.complete(extractionPrompt, {
           maxTokens: EXTRACTION_MAX_TOKENS,
+          signal,
         });
         const parsed = parseExtractionResponse(raw);
         if (!parsed.ok) throw new Error(parsed.error);
@@ -344,9 +366,10 @@ export async function* runGenerationPhase(
       "generate-bullet",
       ["cvProfile", "requirements", "jdText", ...confirmedAnswersKey],
       JSON.stringify(generationPrompt),
-      async () => {
+      async (signal) => {
         const raw = await deps.llm.complete(generationPrompt, {
           maxTokens: GENERATION_MAX_TOKENS,
+          signal,
         });
         const parsed = parseGenerationResponse(raw);
         if (!parsed.ok) throw new Error(parsed.error);
@@ -375,9 +398,10 @@ export async function* runGenerationPhase(
         "ground-bullet",
         [...Object.keys(groundingCtx), ...confirmedAnswersKey],
         JSON.stringify(groundingPrompt),
-        async () => {
+        async (signal) => {
           const raw = await deps.llm.complete(groundingPrompt, {
             maxTokens: GROUNDING_MAX_TOKENS,
+            signal,
           });
           const parsed = parseGroundingResponse(raw);
           if (!parsed.ok) throw new Error(parsed.error);
